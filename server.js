@@ -70,7 +70,7 @@ app.post("/chat", async (req, res) => {
   try {
     const { messages } = req.body;
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
     const systemPrompt = `You are TePilot, an AI agent that can control a web browser. 
 You have access to browser actions. When you need to use the browser, respond with a JSON action block like this:

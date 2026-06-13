@@ -26,10 +26,16 @@ async function getBrowser() {
 async function getPage() {
   const b = await getBrowser();
   if (!page || page.isClosed()) {
-    const context = await b.newContext();
+    const context = await b.newContext({ viewport: { width: 1280, height: 720 } });
     page = await context.newPage();
   }
   return page;
+}
+
+async function takeScreenshot() {
+  const p = await getPage();
+  const buf = await p.screenshot({ type: "jpeg", quality: 70 });
+  return buf.toString("base64");
 }
 
 async function executeAction(action, params) {
@@ -37,25 +43,24 @@ async function executeAction(action, params) {
   switch (action) {
     case "navigate":
       await p.goto(params.url, { waitUntil: "domcontentloaded", timeout: 15000 });
-      return `Navigated to ${params.url}`;
-    case "screenshot": {
-      const buf = await p.screenshot({ type: "jpeg", quality: 60 });
-      return buf.toString("base64");
-    }
+      return { result: `Navigated to ${params.url}`, screenshot: await takeScreenshot() };
     case "click":
       await p.click(params.selector);
-      return `Clicked ${params.selector}`;
+      await p.waitForTimeout(500);
+      return { result: `Clicked ${params.selector}`, screenshot: await takeScreenshot() };
     case "type":
       await p.fill(params.selector, params.text);
-      return `Typed "${params.text}" into ${params.selector}`;
+      return { result: `Typed "${params.text}"`, screenshot: await takeScreenshot() };
     case "get_content": {
       const content = await p.evaluate(() => document.body.innerText);
-      return content.slice(0, 4000);
+      return { result: content.slice(0, 4000), screenshot: await takeScreenshot() };
     }
+    case "screenshot":
+      return { result: "Screenshot taken", screenshot: await takeScreenshot() };
     case "get_url":
-      return p.url();
+      return { result: p.url(), screenshot: null };
     default:
-      return "Unknown action";
+      return { result: "Unknown action", screenshot: null };
   }
 }
 
@@ -97,8 +102,7 @@ Available actions:
 - get_content: {"action": "get_content", "params": {}}
 - get_url: {"action": "get_url", "params": {}}
 
-After getting content or a screenshot result, analyze it and respond to the user.
-If no browser action is needed, just respond normally.
+After each browser action you will receive the result and can continue.
 Always respond in the same language the user used.`;
 
     const groqMessages = [
@@ -108,6 +112,7 @@ Always respond in the same language the user used.`;
 
     let responseText = await groqChat(groqMessages);
     let finalResponse = responseText;
+    let screenshots = [];
     let iterations = 0;
 
     while (iterations < 5) {
@@ -118,17 +123,12 @@ Always respond in the same language the user used.`;
 
       try {
         const actionData = JSON.parse(match[1].trim());
-        const actionResult = await executeAction(actionData.action, actionData.params);
+        const { result, screenshot } = await executeAction(actionData.action, actionData.params);
 
-        let followUpContent;
-        if (actionData.action === "screenshot") {
-          followUpContent = `Screenshot taken. Image is base64 encoded (${actionResult.length} chars). Based on the page, respond to the user's request.`;
-        } else {
-          followUpContent = `Browser action result: ${actionResult}`;
-        }
+        if (screenshot) screenshots.push(screenshot);
 
         groqMessages.push({ role: "assistant", content: responseText });
-        groqMessages.push({ role: "user", content: followUpContent });
+        groqMessages.push({ role: "user", content: `Browser action result: ${result}. Continue helping the user.` });
 
         responseText = await groqChat(groqMessages);
         finalResponse = responseText;
@@ -138,7 +138,10 @@ Always respond in the same language the user used.`;
       }
     }
 
-    res.json({ response: finalResponse });
+    // Clean up action tags from final response
+    finalResponse = finalResponse.replace(/<action>[\s\S]*?<\/action>/g, "").trim();
+
+    res.json({ response: finalResponse, screenshots });
   } catch (error) {
     console.error("Chat error:", error);
     res.status(500).json({ error: error.message });
@@ -146,7 +149,7 @@ Always respond in the same language the user used.`;
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "TePilot Backend running with Groq + llama-3.3-70b!" });
+  res.json({ status: "ok", message: "TePilot Backend running with Groq + screenshots!" });
 });
 
 const PORT = process.env.PORT || 3001;

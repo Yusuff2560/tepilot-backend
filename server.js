@@ -5,67 +5,166 @@ const { chromium } = require("playwright");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL = "llama-3.3-70b-versatile";
 
+// ── Browser state ──────────────────────────────────────────────────────────
 let browser = null;
 let page = null;
+let lastScreenshotHash = null;
+let lastScreenshotB64 = null;
+let screenshotClients = new Set(); // SSE clients
 
-async function getBrowser() {
-  if (!browser) {
+// ── Init browser on startup ────────────────────────────────────────────────
+async function initBrowser() {
+  try {
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--no-first-run",
+        "--mute-audio",
+      ],
     });
-  }
-  return browser;
-}
-
-async function getPage() {
-  const b = await getBrowser();
-  if (!page || page.isClosed()) {
-    const context = await b.newContext({ viewport: { width: 1280, height: 720 } });
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+      javaScriptEnabled: true,
+      bypassCSP: true,
+    });
     page = await context.newPage();
+
+    // Block unnecessary resources for speed
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["font", "media"].includes(type)) return route.abort();
+      return route.continue();
+    });
+
+    await page.goto("about:blank");
+    console.log("Browser ready");
+
+    // Start continuous screenshot loop
+    startScreenshotLoop();
+  } catch (err) {
+    console.error("Browser init failed:", err);
+    setTimeout(initBrowser, 3000);
   }
-  return page;
 }
 
-async function takeScreenshot() {
-  const p = await getPage();
-  const buf = await p.screenshot({ type: "jpeg", quality: 70 });
-  return buf.toString("base64");
+// ── Screenshot loop ────────────────────────────────────────────────────────
+let screenshotLoopActive = false;
+
+async function startScreenshotLoop() {
+  if (screenshotLoopActive) return;
+  screenshotLoopActive = true;
+
+  while (screenshotLoopActive) {
+    try {
+      if (screenshotClients.size > 0 && page && !page.isClosed()) {
+        const buf = await page.screenshot({ type: "jpeg", quality: 55, fullPage: false });
+        const b64 = buf.toString("base64");
+
+        // Simple hash to skip unchanged frames
+        const hash = b64.slice(0, 64) + b64.slice(-64);
+        if (hash !== lastScreenshotHash) {
+          lastScreenshotHash = hash;
+          lastScreenshotB64 = b64;
+          broadcastScreenshot(b64);
+        }
+      }
+    } catch { /* page might be navigating */ }
+
+    // Adaptive delay: fast when clients connected, slow otherwise
+    await sleep(screenshotClients.size > 0 ? 800 : 3000);
+  }
 }
 
+function broadcastScreenshot(b64) {
+  const payload = `data: ${b64}\n\n`;
+  for (const client of screenshotClients) {
+    try { client.write(payload); } catch { screenshotClients.delete(client); }
+  }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ── SSE endpoint for live screenshot stream ────────────────────────────────
+app.get("/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  screenshotClients.add(res);
+
+  // Send last known frame immediately
+  if (lastScreenshotB64) {
+    res.write(`data: ${lastScreenshotB64}\n\n`);
+  }
+
+  req.on("close", () => {
+    screenshotClients.delete(res);
+  });
+});
+
+// ── Browser actions ────────────────────────────────────────────────────────
 async function executeAction(action, params) {
-  const p = await getPage();
+  if (!page || page.isClosed()) throw new Error("Browser not ready");
+
   switch (action) {
-    case "navigate":
-      await p.goto(params.url, { waitUntil: "domcontentloaded", timeout: 15000 });
-      return { result: `Navigated to ${params.url}`, screenshot: await takeScreenshot() };
-    case "click":
-      await p.click(params.selector);
-      await p.waitForTimeout(500);
-      return { result: `Clicked ${params.selector}`, screenshot: await takeScreenshot() };
-    case "type":
-      await p.fill(params.selector, params.text);
-      return { result: `Typed "${params.text}"`, screenshot: await takeScreenshot() };
-    case "get_content": {
-      const content = await p.evaluate(() => document.body.innerText);
-      return { result: content.slice(0, 4000), screenshot: await takeScreenshot() };
+    case "navigate": {
+      await page.goto(params.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await sleep(400); // let page settle
+      return `Navigated to ${params.url}`;
     }
-    case "screenshot":
-      return { result: "Screenshot taken", screenshot: await takeScreenshot() };
+    case "click": {
+      await page.click(params.selector, { timeout: 5000 });
+      await sleep(300);
+      return `Clicked ${params.selector}`;
+    }
+    case "type": {
+      await page.fill(params.selector, params.text);
+      return `Typed "${params.text}" into ${params.selector}`;
+    }
+    case "scroll": {
+      await page.evaluate(({ x, y }) => window.scrollBy(x, y), params);
+      await sleep(200);
+      return `Scrolled`;
+    }
+    case "press": {
+      await page.keyboard.press(params.key);
+      await sleep(200);
+      return `Pressed ${params.key}`;
+    }
+    case "get_content": {
+      const text = await page.evaluate(() => document.body.innerText);
+      return text.slice(0, 5000);
+    }
     case "get_url":
-      return { result: p.url(), screenshot: null };
+      return page.url();
+    case "wait":
+      await sleep(params.ms || 1000);
+      return "Waited";
     default:
-      return { result: "Unknown action", screenshot: null };
+      return "Unknown action";
   }
 }
 
+// ── Groq chat ──────────────────────────────────────────────────────────────
 async function groqChat(messages) {
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -75,84 +174,85 @@ async function groqChat(messages) {
       model: MODEL,
       messages,
       max_tokens: 2048,
-      temperature: 0.7,
+      temperature: 0.6,
+      top_p: 0.9,
     }),
   });
-  const data = await response.json();
+  const data = await res.json();
   if (data.error) throw new Error(data.error.message);
   return data.choices[0].message.content;
 }
 
+// ── Chat endpoint ──────────────────────────────────────────────────────────
 app.post("/chat", async (req, res) => {
   try {
     const { messages } = req.body;
 
-    const systemPrompt = `You are TePilot, an AI agent that can control a web browser.
-When you need to use the browser, respond with a JSON action block like this:
+    const systemPrompt = `You are TePilot, an AI agent controlling a real web browser.
+Use browser actions when needed by outputting an action block:
 
-<action>
-{"action": "navigate", "params": {"url": "https://example.com"}}
-</action>
+<action>{"action": "navigate", "params": {"url": "https://..."}}</action>
+<action>{"action": "click", "params": {"selector": "button.submit"}}</action>
+<action>{"action": "type", "params": {"selector": "#search", "text": "..."}}</action>
+<action>{"action": "press", "params": {"key": "Enter"}}</action>
+<action>{"action": "scroll", "params": {"x": 0, "y": 500}}</action>
+<action>{"action": "get_content", "params": {}}</action>
+<action>{"action": "get_url", "params": {}}</action>
+<action>{"action": "wait", "params": {"ms": 1000}}</action>
 
-Available actions:
-- navigate: {"action": "navigate", "params": {"url": "..."}}
-- screenshot: {"action": "screenshot", "params": {}}
-- click: {"action": "click", "params": {"selector": "..."}}
-- type: {"action": "type", "params": {"selector": "...", "text": "..."}}
-- get_content: {"action": "get_content", "params": {}}
-- get_url: {"action": "get_url", "params": {}}
-
-After each browser action you will receive the result and can continue.
-Always respond in the same language the user used.`;
+Rules:
+- Chain multiple actions when needed
+- After navigate, use get_content to read the page
+- Always respond in the user's language
+- Be concise and direct`;
 
     const groqMessages = [
       { role: "system", content: systemPrompt },
-      ...messages.map((m) => ({ role: m.role, content: m.content })),
+      ...messages.map(m => ({ role: m.role, content: m.content })),
     ];
 
     let responseText = await groqChat(groqMessages);
-    let finalResponse = responseText;
-    let screenshots = [];
     let iterations = 0;
 
-    while (iterations < 5) {
-      const actionRegex = /<action>([\s\S]*?)<\/action>/;
-      const match = actionRegex.exec(responseText);
+    while (iterations < 8) {
+      const match = /<action>([\s\S]*?)<\/action>/.exec(responseText);
       if (!match) break;
       iterations++;
 
       try {
         const actionData = JSON.parse(match[1].trim());
-        const { result, screenshot } = await executeAction(actionData.action, actionData.params);
-
-        if (screenshot) screenshots.push(screenshot);
+        const result = await executeAction(actionData.action, actionData.params);
 
         groqMessages.push({ role: "assistant", content: responseText });
-        groqMessages.push({ role: "user", content: `Browser action result: ${result}. Continue helping the user.` });
-
+        groqMessages.push({ role: "user", content: `Action result: ${result}` });
         responseText = await groqChat(groqMessages);
-        finalResponse = responseText;
       } catch (e) {
-        console.error("Action error:", e);
+        groqMessages.push({ role: "assistant", content: responseText });
+        groqMessages.push({ role: "user", content: `Action failed: ${e.message}` });
+        responseText = await groqChat(groqMessages);
         break;
       }
     }
 
-    // Clean up action tags from final response
-    finalResponse = finalResponse.replace(/<action>[\s\S]*?<\/action>/g, "").trim();
-
-    res.json({ response: finalResponse, screenshots });
-  } catch (error) {
-    console.error("Chat error:", error);
-    res.status(500).json({ error: error.message });
+    const finalResponse = responseText.replace(/<action>[\s\S]*?<\/action>/g, "").trim();
+    res.json({ response: finalResponse });
+  } catch (err) {
+    console.error("Chat error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
+// ── Health ─────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "TePilot Backend running with Groq + screenshots!" });
+  res.json({
+    status: "ok",
+    browser: browser ? "ready" : "starting",
+    clients: screenshotClients.size,
+  });
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`TePilot Backend running on port ${PORT}`);
+app.listen(PORT, async () => {
+  console.log(`TePilot running on ${PORT}`);
+  await initBrowser();
 });

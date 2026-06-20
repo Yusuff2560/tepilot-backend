@@ -7,8 +7,8 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-const GROQ_API_KEY = process.env.groq_api_key || process.env.GROQ_API_KEY;
-const MODEL = "llama-3.3-70b-versatile";
+const OPENROUTER_API_KEY = process.env.openrouter_api_key || process.env.OPENROUTER_API_KEY;
+const MODEL = "moonshotai/kimi-k2.6:free";
 
 // ── Browser state ──────────────────────────────────────────────────────────
 let browser = null;
@@ -164,22 +164,23 @@ async function executeAction(action, params) {
 
 // ── Groq chat ──────────────────────────────────────────────────────────────
 async function groqChat(messages) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${GROQ_API_KEY}`,
+      "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+      "HTTP-Referer": "https://tepilot-frontend.vercel.app",
+      "X-Title": "TePilot",
     },
     body: JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: 2048,
+      max_tokens: 4096,
       temperature: 0.6,
-      top_p: 0.9,
     }),
   });
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
+  if (data.error) throw new Error(JSON.stringify(data.error));
   return data.choices[0].message.content;
 }
 

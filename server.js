@@ -251,7 +251,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || process.env.port || 7860;
 app.listen(PORT, async () => {
   console.log(`TePilot running on ${PORT}`);
   await initBrowser();

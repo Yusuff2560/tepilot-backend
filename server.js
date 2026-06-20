@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const GROQ_API_KEY = process.env.groq_api_key || process.env.GROQ_API_KEY;
-const MODEL = "llama-3.3-70b-versatile";
+const MODEL = "compound-beta";
 
 // ── Browser state ──────────────────────────────────────────────────────────
 let browser = null;
